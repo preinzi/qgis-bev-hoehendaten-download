@@ -4,7 +4,7 @@ A QGIS Processing script that bulk-downloads elevation raster tiles (DGM/DOM, 1m
 
 > **Note:** The tool's interface (parameter labels, log messages, help text) is in German, matching its target audience. This README is in English for discoverability.
 
-<img src="images/screenshot.png" width="400" alt="Screenshot of the tool in QGIS">
+<img src="images/screenshot.jpg" width="400" alt="Screenshot of the tool in QGIS">
 
 ## What it does
 
