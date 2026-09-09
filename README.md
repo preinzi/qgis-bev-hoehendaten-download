@@ -14,8 +14,8 @@ Given an area of interest anywhere in Austria, this tool:
 - Reads only the actual bytes it needs via HTTP range requests directly from BEV's Cloud-Optimized GeoTIFFs (`/vsicurl/`), instead of downloading the full tile — relevant because a single tile can be several GB. Falls back to downloading (and locally caching) the complete tile only if the windowed read fails for some reason.
 - Automatically finds the most recent available edition of each tile, since BEV re-publishes its nationwide mosaic yearly but not every tile is updated in every edition.
 - Lets you pick which elevation model type(s) to fetch — DGM (terrain model) and/or DOM (surface model) — each producing its own mosaic layer.
-- Builds a lightweight VRT mosaic per model type (no pixel duplication on disk) and adds it directly to your QGIS project. The CRS is read directly from a real downloaded piece rather than assumed.
-- Optional on-the-fly reprojection to a target CRS of your choice, via a standard CRS picker; warns you if the best available system transformation is less accurate than the data's own 1m resolution (usually caused by a missing PROJ datum grid).
+- Builds a lightweight VRT mosaic per model type (no pixel duplication on disk) and adds it directly to your QGIS project.
+- Optional on-the-fly reprojection to a target CRS of your choice, via a standard CRS picker.
 - Cancellable mid-run, including a download or windowed read already in progress; failed tiles are reported in the log rather than silently skipped.
 
 ### Note on coordinate reference systems
