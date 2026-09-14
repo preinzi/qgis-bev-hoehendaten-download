@@ -1,4 +1,4 @@
-# BEV Höhendaten Bulk-Download (bundesweit)
+# BEV Höhendaten Bulk-Download
 
 A QGIS Processing script that bulk-downloads elevation raster tiles (DGM/DOM, 1m) from the official BEV (Bundesamt für Eich- und Vermessungswesen) nationwide data catalog for a chosen area, anywhere in Austria, and adds ready-to-use mosaic layers straight to your project.
 
