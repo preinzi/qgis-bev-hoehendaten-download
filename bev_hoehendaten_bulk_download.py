@@ -1,6 +1,6 @@
 """
-BEV Höhendaten Bulk-Download (bundesweit) - QGIS Processing Tool
-==================================================================
+BEV Höhendaten Bulk-Download - QGIS Processing Tool
+====================================================
 Lädt für ein gewähltes Gebiet Höhenraster (DGM/DOM, 1m) aus dem bundesweiten
 BEV-Datenkatalog (data.bev.gv.at) - deckt ganz Österreich ab, nicht nur ein
 einzelnes Bundesland.
@@ -22,6 +22,7 @@ CRS dieses Dienstes).
 import math
 import os
 import re
+import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import date
 from urllib.request import Request, urlopen
@@ -29,12 +30,12 @@ from urllib.request import Request, urlopen
 from qgis.core import (
     QgsCoordinateReferenceSystem,
     QgsProcessingAlgorithm,
+    QgsProcessingContext,
+    QgsProcessingParameterBoolean,
     QgsProcessingParameterCrs,
     QgsProcessingParameterEnum,
     QgsProcessingParameterExtent,
     QgsProcessingParameterFolderDestination,
-    QgsProject,
-    QgsRasterLayer,
 )
 from osgeo import gdal, osr
 
@@ -68,6 +69,108 @@ KNOWN_BEV_CRS_NAMES = {
     "ETRS89-extended / LAEA Europe": "3035",
     "ETRS89 / LAEA Europe": "3035",
 }
+
+
+def robust_replace(src, dst, feedback=None, retries=5, delay=1.5):
+    """os.replace() mit Wiederholung bei transienten Windows-Dateisperren
+    (z.B. Virenscanner direkt nach dem Schreiben einer frischen Datei) -
+    identisches Muster wie im BEV-Orthofoto- und KAGIS-Tool, wo genau das
+    wiederholt zu Fehlern gefuehrt hat."""
+    for attempt in range(retries):
+        if not os.path.exists(src) and os.path.exists(dst):
+            return True
+        try:
+            os.replace(src, dst)
+            return True
+        except (PermissionError, FileNotFoundError):
+            if os.path.exists(dst) and not os.path.exists(src):
+                return True
+            if attempt == retries - 1:
+                return False
+            if feedback is not None:
+                feedback.pushInfo(f"{os.path.basename(dst)}: Datei kurz gesperrt, versuche erneut ...")
+            time.sleep(delay)
+    return False
+
+
+def unique_path(path):
+    """Haengt bei Bedarf _1, _2, ... an, damit eine bereits vorhandene
+    Datei nie ungefragt ueberschrieben wird."""
+    if not os.path.exists(path):
+        return path
+    base, ext = os.path.splitext(path)
+    i = 1
+    while os.path.exists(f"{base}_{i}{ext}"):
+        i += 1
+    return f"{base}_{i}{ext}"
+
+
+class gdal_error_capture:
+    """Sammelt GDALs interne CPL-Fehler-/Warnmeldungen waehrend eines
+    Aufrufs. Noetig, weil gdal.BuildVRT() bekanntermassen KEINE
+    zuverlaessige Python-Exception wirft, selbst mit UseExceptions() -
+    z.B. eine problematische Quelldatei wird nur als Warnung gemeldet und
+    dann stillschweigend uebersprungen (siehe github.com/OSGeo/gdal/
+    issues/4755). Ohne diesen Handler blieb ein solcher Fall beim
+    BEV-Orthofoto-Tool lange unsichtbar."""
+
+    def __init__(self):
+        self.messages = []
+
+    def _handler(self, err_class, err_num, err_msg):
+        self.messages.append(err_msg)
+
+    def __enter__(self):
+        gdal.PushErrorHandler(self._handler)
+        return self
+
+    def __exit__(self, *exc_info):
+        gdal.PopErrorHandler()
+
+
+def add_overviews(path, feedback=None):
+    """Baut interne Pyramiden-Ebenen fuer schnelleres Anzeigen in QGIS.
+    Kein kritischer Fehler, falls das fehlschlaegt."""
+    try:
+        ds = gdal.Open(path, gdal.GA_Update)
+        if ds is not None:
+            ds.BuildOverviews("AVERAGE", [2, 4, 8, 16, 32])
+        ds = None
+    except Exception as e:
+        if feedback is not None:
+            feedback.pushInfo(f"{os.path.basename(path)}: Pyramiden-Erstellung fehlgeschlagen ({e}) - nicht kritisch.")
+
+
+def fix_south_up(paths, cache_dir, feedback=None):
+    """Prueft jede Datei auf 'Sueden-oben'-Ausrichtung (positive Y-
+    Aufloesung) und ersetzt sie bei Bedarf durch eine per gdal.Warp
+    normalisierte Kopie - gdalbuildvrt kann solche Dateien nicht
+    verarbeiten. Genau diese Ausrichtung war beim BEV-Orthofoto-Tool
+    (dieselbe BEV-COG-Infrastruktur) die Ursache eines lange unklaren
+    VRT-Fehlschlags - hier vorsorglich mit uebernommen."""
+    fixed = []
+    for path in paths:
+        try:
+            ds = gdal.Open(path)
+            gt = ds.GetGeoTransform()
+            ds = None
+        except Exception:
+            fixed.append(path)
+            continue
+        if gt[5] <= 0:
+            fixed.append(path)
+            continue
+        if feedback is not None:
+            feedback.pushInfo(f"{os.path.basename(path)}: 'Süden-oben' ausgerichtet - normalisiere ...")
+        os.makedirs(cache_dir, exist_ok=True)
+        norm_path = os.path.join(cache_dir, f"normalized_{os.path.basename(path)}")
+        try:
+            gdal.Warp(norm_path, path, format="GTiff")
+            fixed.append(norm_path)
+        except Exception as e:
+            if feedback is not None:
+                feedback.pushWarning(f"{os.path.basename(path)}: Normalisierung fehlgeschlagen ({e}) - übersprungen.")
+    return fixed
 
 
 def tile_url(model_folder, stichtag, n, e):
@@ -157,7 +260,8 @@ def download_full_tile(url, out_path, feedback=None):
                     if not chunk:
                         break
                     f.write(chunk)
-            os.replace(tmp_path, out_path)
+            if not robust_replace(tmp_path, out_path, feedback=feedback):
+                continue
             return True
         except Exception:
             if feedback is not None and feedback.isCanceled():
@@ -217,8 +321,7 @@ def process_tile(n, e, model_folder, aoi_bbox, out_dir, cache_dir, feedback=None
         ds = gdal.Translate(tmp_out, vsicurl_path, options=translate_options)
         ok = ds is not None
         ds = None
-        if ok and os.path.exists(tmp_out):
-            os.replace(tmp_out, out_path)
+        if ok and os.path.exists(tmp_out) and robust_replace(tmp_out, out_path, feedback=feedback):
             return out_path
     except Exception:
         pass
@@ -255,8 +358,7 @@ def process_tile(n, e, model_folder, aoi_bbox, out_dir, cache_dir, feedback=None
         ds = gdal.Translate(tmp_out, cache_path, options=translate_options)
         ok = ds is not None
         ds = None
-        if ok and os.path.exists(tmp_out):
-            os.replace(tmp_out, out_path)
+        if ok and os.path.exists(tmp_out) and robust_replace(tmp_out, out_path, feedback=feedback):
             return out_path
     except Exception:
         pass
@@ -340,6 +442,7 @@ class BevBulkDownload(QgsProcessingAlgorithm):
     OUTPUT_FOLDER = "OUTPUT_FOLDER"
     MODEL_TYPES_PARAM = "MODEL_TYPES_PARAM"
     TARGET_CRS = "TARGET_CRS"
+    BUILD_OVERVIEWS = "BUILD_OVERVIEWS"
 
     def initAlgorithm(self, config=None):
         self.addParameter(QgsProcessingParameterExtent(self.EXTENT, "Gebiet (AOI)"))
@@ -348,6 +451,9 @@ class BevBulkDownload(QgsProcessingAlgorithm):
             allowMultiple=True, defaultValue=[0, 1]))
         self.addParameter(QgsProcessingParameterCrs(
             self.TARGET_CRS, f"Ziel-CRS (leer lassen = {BEV_CRS})", optional=True))
+        self.addParameter(QgsProcessingParameterBoolean(
+            self.BUILD_OVERVIEWS, "Pyramiden (Übersichtsebenen) für schnelleres Anzeigen erstellen",
+            defaultValue=True))
         self.addParameter(QgsProcessingParameterFolderDestination(self.OUTPUT_FOLDER, "Zielordner"))
 
     def processAlgorithm(self, parameters, context, feedback):
@@ -399,6 +505,7 @@ class BevBulkDownload(QgsProcessingAlgorithm):
         model_names = [list(MODEL_TYPES.keys())[i]
                        for i in self.parameterAsEnums(parameters, self.MODEL_TYPES_PARAM, context)]
         target_crs = self.parameterAsCrs(parameters, self.TARGET_CRS, context)
+        build_overviews = self.parameterAsBoolean(parameters, self.BUILD_OVERVIEWS, context)
 
         if target_crs.isValid():
             acc = check_transform_accuracy(BEV_CRS, target_crs.authid())
@@ -446,8 +553,12 @@ class BevBulkDownload(QgsProcessingAlgorithm):
                 feedback.pushWarning(f"{mname}: keine Kacheln erfolgreich verarbeitet.")
                 continue
 
+            # Vorsorglich auf "Sueden-oben"-Ausrichtung pruefen - siehe
+            # fix_south_up()-Docstring fuer den Hintergrund.
+            pieces = fix_south_up(pieces, os.path.join(out_root, "_cache", "_normalized"), feedback=feedback)
+
             try:
-                vrt_path = os.path.join(out_dir, f"{mname}_mosaic.vrt")
+                vrt_path = unique_path(os.path.join(out_dir, f"{mname}_mosaic.vrt"))
 
                 # WICHTIG: NICHT blind BEV_CRS erzwingen, ohne das zu
                 # pruefen - genau diese Annahme hat sich beim KAGIS-Tool
@@ -502,7 +613,10 @@ class BevBulkDownload(QgsProcessingAlgorithm):
                         feedback.pushInfo(f"{mname}: Original-Kachel-CRS als EPSG:{epsg_code} identifiziert.")
 
                 vrt_options = gdal.BuildVRTOptions(outputSRS=tile_wkt)
-                gdal.BuildVRT(vrt_path, pieces, options=vrt_options)
+                with gdal_error_capture() as cap:
+                    gdal.BuildVRT(vrt_path, pieces, options=vrt_options)
+                for msg in cap.messages:
+                    feedback.pushWarning(f"{mname}: GDAL meldete beim VRT-Bau: {msg}")
 
                 check_ds = gdal.Open(vrt_path)
                 final_wkt = check_ds.GetProjection() if check_ds is not None else ""
@@ -523,12 +637,14 @@ class BevBulkDownload(QgsProcessingAlgorithm):
                 final_path = vrt_path
                 if target_crs.isValid():
                     safe_authid = target_crs.authid().replace(":", "_") or "custom_crs"
-                    warped_path = os.path.join(out_dir, f"{mname}_mosaic_{safe_authid}.vrt")
+                    warped_path = unique_path(os.path.join(out_dir, f"{mname}_mosaic_{safe_authid}.vrt"))
                     gdal.Warp(warped_path, vrt_path, dstSRS=target_crs.toWkt(),
                               format="VRT", resampleAlg="cubic")
                     feedback.pushInfo(f"{mname}: nach {target_crs.authid()} umprojiziert -> {warped_path}")
                     final_path = warped_path
 
+                if build_overviews:
+                    add_overviews(final_path, feedback=feedback)
                 results[mname] = final_path
             except Exception as e:
                 feedback.pushWarning(f"{mname}: VRT-Erstellung/Umprojektion fehlgeschlagen ({e}) - uebersprungen.")
@@ -538,18 +654,10 @@ class BevBulkDownload(QgsProcessingAlgorithm):
             feedback.pushInfo(
                 f"Abgebrochen - {len(results)} bereits vollstaendig verarbeitete Layer werden trotzdem hinzugefuegt.")
 
-        for label, vrt_path in results.items():
-            layer = QgsRasterLayer(vrt_path, label)
-            if layer.isValid():
-                if not layer.crs().isValid():
-                    layer.setCrs(QgsCoordinateReferenceSystem(BEV_CRS))
-                    feedback.pushInfo(f"Layer '{label}': CRS manuell auf {BEV_CRS} gesetzt.")
-                else:
-                    feedback.pushInfo(f"Layer '{label}': CRS automatisch erkannt ({layer.crs().authid()}).")
-                QgsProject.instance().addMapLayer(layer)
-                feedback.pushInfo(f"Layer '{label}' zum Projekt hinzugefuegt.")
-            else:
-                feedback.pushWarning(f"Layer '{label}' konnte nicht geladen werden: {vrt_path}")
+        for label, path in results.items():
+            context.addLayerToLoadOnCompletion(
+                path, QgsProcessingContext.LayerDetails(label, context.project(), label))
+            feedback.pushInfo(f"Layer '{label}' zum Laden vorgemerkt -> {path}")
 
         summary = f"Fertig: {len(results)} Layer hinzugefuegt."
         if outer_canceled:
@@ -562,13 +670,13 @@ class BevBulkDownload(QgsProcessingAlgorithm):
         return "bev_hoehendaten_bulk_download"
 
     def displayName(self):
-        return "BEV Höhendaten Bulk-Download (bundesweit)"
+        return "BEV Höhendaten Bulk-Download"
 
     def group(self):
-        return "BEV"
+        return "LiberGIS"
 
     def groupId(self):
-        return "bev"
+        return "libergis"
 
     def shortHelpString(self):
         return (
