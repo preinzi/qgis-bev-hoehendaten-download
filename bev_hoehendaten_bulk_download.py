@@ -128,6 +128,55 @@ class gdal_error_capture:
         gdal.PopErrorHandler()
 
 
+def build_verified_vrt(sources, out_dir, label, tile_crs, feedback=None, dst_crs=None, retries=3):
+    """Baut ein VRT (Mosaik, oder mit dst_crs eine per Warp virtuell
+    umprojizierte Fassung - ein "warped VRT") und verifiziert danach
+    tatsaechliche EXISTENZ (nicht nur Oeffenbarkeit) - GDALs Python-
+    Bindings koennen erfolgreich zurueckkehren, ohne dass die Datei
+    tatsaechlich geschrieben wurde. Bei Fehlschlag wird mit einem frischen
+    Dateinamen erneut versucht. dst_crs sollte der einfache EPSG-Code sein
+    (z.B. "EPSG:25833"), nicht die volle WKT-Beschreibung - letztere ist
+    bei modernen PROJ-Versionen sehr lang/komplex und unnoetig."""
+    vrt_ok = False
+    vrt_path = None
+    for attempt in range(retries):
+        vrt_path = unique_path(os.path.join(out_dir, f"{label}.vrt"))
+        with gdal_error_capture() as cap:
+            if dst_crs is not None:
+                gdal.Warp(vrt_path, sources, dstSRS=dst_crs, format="VRT", resampleAlg="cubic")
+            else:
+                gdal.BuildVRT(vrt_path, sources, options=gdal.BuildVRTOptions(outputSRS=tile_crs))
+        if feedback is not None:
+            for msg in cap.messages:
+                feedback.pushWarning(f"{label}: GDAL meldete beim VRT-Bau: {msg}")
+        if not os.path.exists(vrt_path):
+            if feedback is not None:
+                feedback.pushInfo(
+                    f"{label}: VRT-Datei fehlt nach dem Bauen unerwartet - versuche mit neuem "
+                    "Dateinamen erneut ...")
+            time.sleep(2)
+            continue
+        for _ in range(3):
+            try:
+                check_ds = gdal.Open(vrt_path)
+                if check_ds is not None:
+                    check_ds = None
+                    vrt_ok = True
+                    break
+            except Exception:
+                pass
+            if feedback is not None:
+                feedback.pushInfo(f"{label}: VRT noch nicht sofort lesbar, versuche erneut ...")
+            time.sleep(2)
+        if vrt_ok:
+            break
+    if not vrt_ok:
+        raise RuntimeError("VRT konnte trotz mehrerer Versuche nicht zuverlässig erstellt werden")
+    if feedback is not None:
+        feedback.pushInfo(f"{label}: VRT erstellt -> {vrt_path}")
+    return vrt_path
+
+
 def add_overviews(path, feedback=None):
     """Baut interne Pyramiden-Ebenen fuer schnelleres Anzeigen in QGIS.
     Kein kritischer Fehler, falls das fehlschlaegt."""
@@ -558,8 +607,6 @@ class BevBulkDownload(QgsProcessingAlgorithm):
             pieces = fix_south_up(pieces, os.path.join(out_root, "_cache", "_normalized"), feedback=feedback)
 
             try:
-                vrt_path = unique_path(os.path.join(out_dir, f"{mname}_mosaic.vrt"))
-
                 # WICHTIG: NICHT blind BEV_CRS erzwingen, ohne das zu
                 # pruefen - genau diese Annahme hat sich beim KAGIS-Tool
                 # als falsch herausgestellt (dort fuer einen der beiden
@@ -612,23 +659,10 @@ class BevBulkDownload(QgsProcessingAlgorithm):
                         tile_wkt = f"EPSG:{epsg_code}"
                         feedback.pushInfo(f"{mname}: Original-Kachel-CRS als EPSG:{epsg_code} identifiziert.")
 
-                vrt_options = gdal.BuildVRTOptions(outputSRS=tile_wkt)
-                with gdal_error_capture() as cap:
-                    gdal.BuildVRT(vrt_path, pieces, options=vrt_options)
-                for msg in cap.messages:
-                    feedback.pushWarning(f"{mname}: GDAL meldete beim VRT-Bau: {msg}")
-
-                check_ds = gdal.Open(vrt_path)
-                final_wkt = check_ds.GetProjection() if check_ds is not None else ""
-                check_ds = None
-                if final_wkt:
-                    feedback.pushInfo(f"{mname}: VRT-Projektion aus Original-Kachelstueck uebernommen.")
-                else:
-                    feedback.pushWarning(f"{mname}: VRT hat auch nach outputSRS KEINE Projektion - bitte melden!")
-
+                vrt_path = build_verified_vrt(pieces, out_dir, f"{mname}_mosaic", tile_wkt, feedback=feedback)
                 feedback.pushInfo(
-                    f"{mname}: VRT erstellt ({len(pieces)} von {len(tiles)} Kachel(n) "
-                    f"erfolgreich verarbeitet, {BEV_CRS}) -> {vrt_path}")
+                    f"{mname}: Mosaik aus {len(pieces)} von {len(tiles)} Kachel(n) erfolgreich "
+                    f"verarbeitet ({BEV_CRS}).")
                 if len(pieces) < len(tiles):
                     feedback.pushWarning(
                         f"{mname}: nur {len(pieces)} von {len(tiles)} Kacheln im Mosaik - "
@@ -637,11 +671,16 @@ class BevBulkDownload(QgsProcessingAlgorithm):
                 final_path = vrt_path
                 if target_crs.isValid():
                     safe_authid = target_crs.authid().replace(":", "_") or "custom_crs"
-                    warped_path = unique_path(os.path.join(out_dir, f"{mname}_mosaic_{safe_authid}.vrt"))
-                    gdal.Warp(warped_path, vrt_path, dstSRS=target_crs.toWkt(),
-                              format="VRT", resampleAlg="cubic")
-                    feedback.pushInfo(f"{mname}: nach {target_crs.authid()} umprojiziert -> {warped_path}")
-                    final_path = warped_path
+                    # WICHTIG: Den einfachen EPSG-Code uebergeben, nicht die
+                    # volle WKT-Beschreibung (target_crs.toWkt()) - moderne
+                    # PROJ-Versionen erzeugen dabei sehr lange, komplexe
+                    # WKT2-Strings, die GDALs oder QGIS' eigene CRS-Erkennung
+                    # beim spaeteren Oeffnen der Datei ausbremsen koennten.
+                    dst_crs_str = target_crs.authid() or target_crs.toWkt()
+                    final_path = build_verified_vrt(
+                        [vrt_path], out_dir, f"{mname}_mosaic_{safe_authid}", tile_wkt,
+                        feedback=feedback, dst_crs=dst_crs_str)
+                    feedback.pushInfo(f"{mname}: nach {target_crs.authid()} umprojiziert -> {final_path}")
 
                 if build_overviews:
                     add_overviews(final_path, feedback=feedback)
