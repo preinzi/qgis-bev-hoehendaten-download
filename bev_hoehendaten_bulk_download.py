@@ -21,7 +21,6 @@ CRS dieses Dienstes).
 
 import math
 import os
-import re
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import date
@@ -54,6 +53,7 @@ osr.UseExceptions()
 BASE_URL = "https://data.bev.gv.at/download/ALS"
 BEV_CRS = "EPSG:3035"
 TILE_SIZE = 50000  # Meter, Kachelraster in EPSG:3035
+PIXEL_SIZE = 1.0  # Meter, Aufloesung der Hoehendaten
 
 # Anzeigename -> (Ordnername im Download-Pfad, Datei-Praefix)
 MODEL_TYPES = {
@@ -62,9 +62,9 @@ MODEL_TYPES = {
 }
 
 # Bekannte Namensvarianten fuer EPSG:3035 als Rueckfallebene, falls
-# osr.AutoIdentifyEPSG() eine Kachel-CRS nicht erkennt (bei KAGIS beobachtet:
-# schon winzige Gleitkomma-Abweichungen im Ellipsoid reichen, damit der
-# exakte Datenbankabgleich scheitert, obwohl der CRS-NAME eindeutig ist).
+# osr.AutoIdentifyEPSG() eine Kachel-CRS nicht erkennt (schon winzige
+# Gleitkomma-Abweichungen im Ellipsoid reichen, damit der exakte
+# Datenbankabgleich scheitert, obwohl der CRS-NAME eindeutig ist).
 KNOWN_BEV_CRS_NAMES = {
     "ETRS89-extended / LAEA Europe": "3035",
     "ETRS89 / LAEA Europe": "3035",
@@ -74,8 +74,8 @@ KNOWN_BEV_CRS_NAMES = {
 def robust_replace(src, dst, feedback=None, retries=5, delay=1.5):
     """os.replace() mit Wiederholung bei transienten Windows-Dateisperren
     (z.B. Virenscanner direkt nach dem Schreiben einer frischen Datei) -
-    identisches Muster wie im BEV-Orthofoto- und KAGIS-Tool, wo genau das
-    wiederholt zu Fehlern gefuehrt hat."""
+    ohne Wiederholung fuehrt so eine kurze Sperre sonst zu einem
+    unnoetigen Fehlschlag."""
     for attempt in range(retries):
         if not os.path.exists(src) and os.path.exists(dst):
             return True
@@ -111,8 +111,8 @@ class gdal_error_capture:
     zuverlaessige Python-Exception wirft, selbst mit UseExceptions() -
     z.B. eine problematische Quelldatei wird nur als Warnung gemeldet und
     dann stillschweigend uebersprungen (siehe github.com/OSGeo/gdal/
-    issues/4755). Ohne diesen Handler blieb ein solcher Fall beim
-    BEV-Orthofoto-Tool lange unsichtbar."""
+    issues/4755). Ohne diesen Handler bliebe ein solcher Fall
+    unsichtbar."""
 
     def __init__(self):
         self.messages = []
@@ -194,9 +194,8 @@ def fix_south_up(paths, cache_dir, feedback=None):
     """Prueft jede Datei auf 'Sueden-oben'-Ausrichtung (positive Y-
     Aufloesung) und ersetzt sie bei Bedarf durch eine per gdal.Warp
     normalisierte Kopie - gdalbuildvrt kann solche Dateien nicht
-    verarbeiten. Genau diese Ausrichtung war beim BEV-Orthofoto-Tool
-    (dieselbe BEV-COG-Infrastruktur) die Ursache eines lange unklaren
-    VRT-Fehlschlags - hier vorsorglich mit uebernommen."""
+    verarbeiten und wuerde sie sonst stillschweigend ueberspringen, was
+    zu einem schwer nachvollziehbaren VRT-Fehlschlag fuehrt."""
     fixed = []
     for path in paths:
         try:
@@ -336,8 +335,14 @@ def process_tile(n, e, model_folder, aoi_bbox, out_dir, cache_dir, feedback=None
         min(aoi_bbox[2], tile_bounds[2]),
         min(aoi_bbox[3], tile_bounds[3]),
     )
-    if window[0] >= window[2] or window[1] >= window[3]:
-        return None  # keine echte Ueberschneidung (Rundungsrand)
+    # Fenster, die schmaler als ein Pixel sind, wie "keine Ueberschneidung"
+    # behandeln - z.B. wenn die AOI nach einer Umprojektion nur um
+    # Rundungsrauschen ueber eine Kachelgrenze ragt. gdal.Translate(projWin)
+    # bricht bei so einem Fenster mit "negative width" ab, und der Rueckfall
+    # unten wuerde dann die komplette 50x50-km-Kachel herunterladen, nur um
+    # beim Zuschneiden erneut zu scheitern.
+    if window[2] - window[0] < PIXEL_SIZE or window[3] - window[1] < PIXEL_SIZE:
+        return None
 
     url, stichtag = find_tile_url(model_folder, n, e)
     if not url:
@@ -361,6 +366,7 @@ def process_tile(n, e, model_folder, aoi_bbox, out_dir, cache_dir, feedback=None
     tmp_out = out_path + ".part"
 
     # Primaer: direktes Fenster-Lesen per HTTP-Range aus der Remote-COG.
+    window_error = None
     try:
         vsicurl_path = "/vsicurl/" + url
         translate_options = gdal.TranslateOptions(
@@ -372,8 +378,8 @@ def process_tile(n, e, model_folder, aoi_bbox, out_dir, cache_dir, feedback=None
         ds = None
         if ok and os.path.exists(tmp_out) and robust_replace(tmp_out, out_path, feedback=feedback):
             return out_path
-    except Exception:
-        pass
+    except Exception as e:
+        window_error = e
     try:
         if os.path.exists(tmp_out):
             os.remove(tmp_out)
@@ -387,8 +393,9 @@ def process_tile(n, e, model_folder, aoi_bbox, out_dir, cache_dir, feedback=None
     # Lauf im ueberlappenden Gebiet muss sie nicht nochmal ziehen) und lokal
     # zuschneiden.
     if feedback is not None:
+        reason = f" ({window_error})" if window_error else ""
         feedback.pushWarning(
-            f"{tile_id}: direktes Fenster-Lesen fehlgeschlagen - lade komplette "
+            f"{tile_id}: direktes Fenster-Lesen fehlgeschlagen{reason} - lade komplette "
             "Kachel als Rueckfallebene (kann sehr gross sein).")
     os.makedirs(cache_dir, exist_ok=True)
     cache_path = os.path.join(cache_dir, f"{model_folder}_{tile_id}_{stichtag}_full.tif")
@@ -421,7 +428,7 @@ def process_tile(n, e, model_folder, aoi_bbox, out_dir, cache_dir, feedback=None
 def run_tile_processing(tiles, model_folder, aoi_bbox, out_dir, cache_dir, feedback,
                          max_workers=3, progress_base=0, progress_span=100):
     """Verarbeitet mehrere Kacheln parallel, abbrechbar innerhalb ca. 1 Sekunde
-    (gleiches Muster wie im KAGIS-Tool: kein 'with'-Statement fuer den
+    (bewusst kein 'with'-Statement fuer den
     Executor, damit ein Abbruch nicht durch automatisches wait=True beim
     Verlassen des Blocks wieder blockiert)."""
     results = []
@@ -462,6 +469,14 @@ def run_tile_processing(tiles, model_folder, aoi_bbox, out_dir, cache_dir, feedb
 # durchgefuehrte CRS-Umrechnung zu erkennen, die sonst still falsche
 # (unveraenderte) Koordinaten durchreichen wuerde.
 AUSTRIA_3035_SANITY_BOUNDS = (4_000_000, 2_400_000, 5_200_000, 3_000_000)
+
+# Harte Obergrenze, ab der der Lauf SOFORT abgebrochen wird. Grosszuegig
+# ueber der Flaeche ganz Oesterreichs (~83.900 km²) gewaehlt, damit eine
+# tatsaechlich beabsichtigte landesweite Anfrage nicht blockiert wird - aber
+# weit unter einer versehentlich kontinent-grossen AOI (z.B. durch eine falsch
+# interpretierte Koordinatenreihenfolge im Extent-Parameter), die sonst zu
+# riesigen Downloads und Abstuerzen mangels Speicherplatz fuehren wuerde.
+ABORT_AREA_KM2 = 200_000
 
 
 def looks_like_valid_3035_austria(bbox):
@@ -506,34 +521,20 @@ class BevBulkDownload(QgsProcessingAlgorithm):
         self.addParameter(QgsProcessingParameterFolderDestination(self.OUTPUT_FOLDER, "Zielordner"))
 
     def processAlgorithm(self, parameters, context, feedback):
-        # WICHTIG: parameterAsExtent()/QgsRectangle kann fuer bestimmte
-        # Projekt-CRS-Kombinationen beim Parsen des Extent-Strings Werte
-        # vertauschen (bei KAGIS reproduzierbar beobachtet und dort behoben -
-        # siehe kagis_hoehendaten_bulk_download.py). Vorbeugend genauso: den
-        # rohen Parameter-String selbst parsen statt den Objekt-Accessoren
-        # zu vertrauen, mit Fallback auf die normale QGIS-Methode falls der
-        # Rohwert kein String ist (z.B. bei Aufruf aus dem Modeler).
-        raw_value = parameters.get(self.EXTENT)
-        match = re.match(
-            r"\s*([\-0-9.eE]+)\s*,\s*([\-0-9.eE]+)\s*,\s*([\-0-9.eE]+)\s*,\s*([\-0-9.eE]+)"
-            r"\s*(?:\[\s*([^\]]+?)\s*\])?\s*$",
-            raw_value) if isinstance(raw_value, str) else None
-        if match:
-            raw_bbox = tuple(float(match.group(i)) for i in range(1, 5))
-            raw_crs = QgsCoordinateReferenceSystem(match.group(5)) if match.group(5) \
-                else self.parameterAsExtentCrs(parameters, self.EXTENT, context)
-            if raw_crs.authid() == BEV_CRS:
-                aoi_bbox = raw_bbox
-            else:
-                extent_native = self.parameterAsExtent(
-                    parameters, self.EXTENT, context, QgsCoordinateReferenceSystem(BEV_CRS))
-                aoi_bbox = (extent_native.xMinimum(), extent_native.yMinimum(),
-                            extent_native.xMaximum(), extent_native.yMaximum())
-        else:
-            extent_native = self.parameterAsExtent(
-                parameters, self.EXTENT, context, QgsCoordinateReferenceSystem(BEV_CRS))
-            aoi_bbox = (extent_native.xMinimum(), extent_native.yMinimum(),
-                        extent_native.xMaximum(), extent_native.yMaximum())
+        # WICHTIG: Der Extent-Parameter wird von QGIS Processing immer im
+        # Format "xmin,xmax,ymin,ymax [CRS]" gespeichert (NICHT
+        # xmin,ymin,xmax,ymax) - so schreibt ihn der Processing-Dialog und so
+        # liest ihn parameterAsExtent(). Ein eigener Parser mit falscher
+        # Reihenfolge-Annahme hat frueher bei einer AOI in EPSG:3035 eine
+        # verdrehte AOI ergeben. Deshalb wird die AOI ausschliesslich ueber
+        # QGIS' eigenen Parser gelesen und dabei direkt nach EPSG:3035
+        # umgerechnet (fuer eine AOI, die schon in EPSG:3035 vorliegt, ist
+        # das keine Umrechnung). Das funktioniert auch fuer Layer-IDs oder
+        # Aufrufe aus dem Modeler, nicht nur fuer Strings.
+        extent_native = self.parameterAsExtent(
+            parameters, self.EXTENT, context, QgsCoordinateReferenceSystem(BEV_CRS))
+        aoi_bbox = (extent_native.xMinimum(), extent_native.yMinimum(),
+                    extent_native.xMaximum(), extent_native.yMaximum())
         feedback.pushInfo(
             f"AOI in {BEV_CRS}: xmin={aoi_bbox[0]:.1f}, ymin={aoi_bbox[1]:.1f}, "
             f"xmax={aoi_bbox[2]:.1f}, ymax={aoi_bbox[3]:.1f}")
@@ -548,6 +549,19 @@ class BevBulkDownload(QgsProcessingAlgorithm):
                 "Bitte in QGIS unter Einstellungen > Optionen > CRS-Verwaltung den "
                 "Netzwerk-Download von PROJ-Gittern aktivieren, oder in den "
                 "Projekteigenschaften > Transformationen die betroffene Umrechnung pruefen.")
+            return {}
+
+        width_km = (aoi_bbox[2] - aoi_bbox[0]) / 1000
+        height_km = (aoi_bbox[3] - aoi_bbox[1]) / 1000
+        area_km2 = width_km * height_km
+        feedback.pushInfo(f"AOI-Größe: {width_km:.1f} × {height_km:.1f} km ({area_km2:.0f} km²).")
+        if area_km2 > ABORT_AREA_KM2:
+            feedback.reportError(
+                f"Abgebrochen: Das berechnete Gebiet ist mit {area_km2:.0f} km² unplausibel groß "
+                f"(größer als {ABORT_AREA_KM2:.0f} km² - mehr als die Fläche ganz Österreichs). Das "
+                "deutet auf eine falsch interpretierte AOI hin, nicht auf eine tatsächlich "
+                "beabsichtigte Anfrage. Bitte die AOI (Gebiet) erneut setzen, z.B. über 'Gebiet aus "
+                "Layer' mit dem gewünschten Layer.")
             return {}
 
         out_root = self.parameterAsString(parameters, self.OUTPUT_FOLDER, context)
@@ -608,13 +622,11 @@ class BevBulkDownload(QgsProcessingAlgorithm):
 
             try:
                 # WICHTIG: NICHT blind BEV_CRS erzwingen, ohne das zu
-                # pruefen - genau diese Annahme hat sich beim KAGIS-Tool
-                # als falsch herausgestellt (dort fuer einen der beiden
-                # Zyklen). Bei BEV als bundesweitem, einheitlichem Datensatz
+                # pruefen. Bei BEV als bundesweitem, einheitlichem Datensatz
                 # ist es zwar sehr wahrscheinlich, dass wirklich ueberall
-                # EPSG:3035 vorliegt - aber ungeprueft war das bisher nur
-                # eine Annahme. Stattdessen die echte CRS aus einem
-                # tatsaechlich verarbeiteten Kachelstueck auslesen.
+                # EPSG:3035 vorliegt - aber ungeprueft ist das nur eine
+                # Annahme. Stattdessen die echte CRS aus einem tatsaechlich
+                # verarbeiteten Kachelstueck auslesen.
                 src_ds = gdal.Open(pieces[0])
                 tile_wkt = src_ds.GetProjection() if src_ds is not None else ""
                 src_ds = None
@@ -625,8 +637,7 @@ class BevBulkDownload(QgsProcessingAlgorithm):
                     tile_wkt = BEV_CRS
                 else:
                     # Drei Ebenen, JEDE EINZELN in try/except (eine Exception
-                    # in Ebene 1 darf die folgenden Ebenen nicht verhindern -
-                    # genau dieser Fehler ist beim KAGIS-Tool einmal passiert).
+                    # in Ebene 1 darf die folgenden Ebenen nicht verhindern).
                     epsg_code = None
 
                     try:
