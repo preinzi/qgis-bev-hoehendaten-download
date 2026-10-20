@@ -13,6 +13,7 @@ Given an area of interest anywhere in Austria, this tool:
 - Computes which of BEV's nationwide 50×50 km tiles cover your area directly from the coordinates — no catalog search needed, since the tile grid is fixed and the tile IDs encode their own position.
 - Reads only the actual bytes it needs via HTTP range requests directly from BEV's Cloud-Optimized GeoTIFFs (`/vsicurl/`), instead of downloading the full tile — relevant because a single tile can be several GB. Falls back to downloading (and locally caching) the complete tile only if the windowed read fails for some reason.
 - Automatically finds the most recent available edition of each tile, since BEV re-publishes its nationwide mosaic yearly but not every tile is updated in every edition.
+- Stops right away if the chosen area is implausibly large (over 200,000 km², more than all of Austria), since that points to a misread area rather than a real request.
 - Lets you pick which elevation model type(s) to fetch — DGM (terrain model) and/or DOM (surface model) — each producing its own mosaic layer.
 - Builds a lightweight VRT mosaic per model type (no pixel duplication on disk) and adds it directly to your QGIS project.
 - Optional on-the-fly reprojection to a target CRS of your choice, via a standard CRS picker.
@@ -28,9 +29,9 @@ This is a single-file **Processing script**, not a full plugin:
 
 1. Download [`bev_hoehendaten_bulk_download.py`](https://github.com/preinzi/qgis-bev-hoehendaten-download/blob/main/bev_hoehendaten_bulk_download.py).
 2. In QGIS: **Processing → Toolbox → Scripts (gear icon) → Add Script to Toolbox…**, and select the file.
-3. It will appear under **Skripte/Scripts → BEV → BEV Höhendaten Bulk-Download (bundesweit)**.
+3. It will appear under **Skripte/Scripts → LiberGIS → BEV Höhendaten Bulk-Download**.
 
-No extra Python packages required beyond what ships with QGIS (uses only the Python standard library plus the bundled GDAL/PyQGIS). Optionally, if [`pyproj`](https://pypi.org/project/pyproj/) is installed, the tool also warns you about the accuracy of a chosen target-CRS reprojection — but this is not a hard requirement. Tested on QGIS 3.34 LTR (Linux) and QGIS 3.44 LTR (Windows).
+No extra Python packages required beyond what ships with QGIS (uses only the Python standard library plus the bundled GDAL/PyQGIS). Optionally, if [`pyproj`](https://pypi.org/project/pyproj/) is installed, the tool also warns you about the accuracy of a chosen target-CRS reprojection — but this is not a hard requirement. Tested on QGIS 3.34 LTR (Linux), QGIS 3.44 LTR (Windows) and QGIS 4.2 (Linux).
 
 ## Usage
 
